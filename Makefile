@@ -7,7 +7,7 @@ NEXTEST_RUN_ARGS := --no-fail-fast --success-output never --failure-output final
 #
 
 check:
-	${CARGO} check --workspace
+	${CARGO} check --locked --workspace
 
 fmt:
 	${CARGO} fmt --all --check
@@ -16,7 +16,7 @@ clippy:
 	${CARGO} clippy --locked --workspace --tests -- --deny warnings
 
 test:
-	${CARGO} nextest run ${NEXTEST_RUN_ARGS} --workspace
+	${CARGO} nextest run ${NEXTEST_RUN_ARGS} --locked --workspace
 
 #
 # Build
@@ -26,7 +26,7 @@ doc:
 	${CARGO} doc --workspace --no-deps
 
 build:
-	${CARGO} build --workspace
+	${CARGO} build --locked --workspace
 
 release:
-	${CARGO} build --workspace --release
+	${CARGO} build --locked --workspace --release

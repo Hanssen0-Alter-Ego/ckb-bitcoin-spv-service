@@ -7,3 +7,6 @@ pub(crate) mod schemas;
 
 pub use internal::Storage;
 pub use result::Error;
+
+#[cfg(test)]
+mod tests;
