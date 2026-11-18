@@ -13,6 +13,23 @@ they can be verified on [CKB].
 [License]: https://img.shields.io/badge/License-MIT-blue.svg
 [GitHub Actions]: https://github.com/yangby-cryptape/ckb-bitcoin-spv-service/workflows/CI/badge.svg
 
+## Development checks
+
+CI uses Rust 1.76.0 and runs `make fmt`, `make clippy`, `make build`, and
+`make test` (the last command requires cargo-nextest). Build and test commands
+use the committed lockfile. To run unit tests without nextest:
+
+```sh
+cargo +1.76.0 test --locked --workspace
+```
+
+Building RocksDB requires a C/C++ toolchain and libclang with its standard
+headers; the default TLS feature also needs OpenSSL development libraries.
+The storage regression uses a temporary RocksDB database and synthetic linked
+headers to check proof generation against the pinned verifier, including
+rejection of a tampered MMR proof. It requires no Bitcoin or CKB RPC endpoint
+and does not test Bitcoin consensus or deployed contracts.
+
 ## Usage
 
 With the command line option `-h`(alias of `--help`), help will be printed.
