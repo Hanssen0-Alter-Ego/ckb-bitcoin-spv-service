@@ -49,3 +49,229 @@ fn generated_transaction_proof_rejects_a_tampered_header_mmr() {
         Err(VerifyTxError::HeaderMmrProof as i8),
     );
 }
+
+// These fixtures deliberately do not mine headers. Storage checks linkage and
+// builds MMRs; PoW/Bitcoin consensus belongs to the verifier's separate tests.
+// All-leaf checks request zero confirmations so they include the current tip.
+fn linked_blocks(count: usize, nonce_offset: u32) -> Vec<bitcoin::Block> {
+    let mut blocks = vec![genesis_block(Network::Bitcoin)];
+    for index in 1..count {
+        let mut block = blocks[index - 1].clone();
+        block.header.prev_blockhash = blocks[index - 1].block_hash();
+        block.header.time += 600;
+        block.header.nonce = block.header.nonce.wrapping_add(nonce_offset + index as u32);
+        blocks.push(block);
+    }
+    blocks
+}
+
+fn transaction_proof(
+    storage: &Storage,
+    block: &bitcoin::Block,
+    height: u32,
+    tip: u32,
+) -> packed::TransactionProof {
+    let txid = block.txdata[0].txid();
+    let merkle_block = MerkleBlock::from_block_with_predicate(block, |id| *id == txid);
+    packed::TransactionProof::new_builder()
+        .tx_index(0u32.pack())
+        .height(height.pack())
+        .transaction_proof(core::Bytes::from(serialize(&merkle_block)).pack())
+        .header_proof(
+            storage
+                .generate_headers_proof(tip, vec![height])
+                .unwrap()
+                .pack(),
+        )
+        .build()
+}
+
+fn client_at_tip(storage: &Storage, mut checkpoint: core::SpvClient) -> packed::SpvClient {
+    let (height, header) = storage.tip_state().unwrap();
+    checkpoint.headers_mmr_root = storage.generate_headers_root(height).unwrap().unpack();
+    checkpoint.tip_block_hash = header.block_hash().into();
+    checkpoint.pack()
+}
+
+#[test]
+fn batching_headers_preserves_roots_and_transaction_proofs() {
+    // Exercise a nonzero base and several peak/carry boundaries, not just a
+    // two-leaf tree. Every append strategy must produce the same public state.
+    const BASE: u32 = 42;
+    let blocks = linked_blocks(10, 1);
+    let one_directory = tempfile::tempdir().unwrap();
+    let one = Storage::new(one_directory.path()).unwrap();
+    let checkpoint = one.initialize_with(BASE, blocks[0].header).unwrap();
+    one.append_headers(blocks[1..].iter().map(|block| block.header).collect())
+        .unwrap();
+    let expected_client = client_at_tip(&one, checkpoint);
+    let tip = BASE + blocks.len() as u32 - 1;
+
+    for batch_size in [1, 2, 3, 4, 8] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        let checkpoint = storage.initialize_with(BASE, blocks[0].header).unwrap();
+        for batch in blocks[1..].chunks(batch_size) {
+            storage
+                .append_headers(batch.iter().map(|block| block.header).collect())
+                .unwrap();
+        }
+        assert_eq!(storage.base_state().unwrap(), one.base_state().unwrap());
+        assert_eq!(storage.tip_state().unwrap(), one.tip_state().unwrap());
+        let client = client_at_tip(&storage, checkpoint);
+        assert_eq!(client.as_slice(), expected_client.as_slice());
+        for (index, block) in blocks.iter().enumerate() {
+            let height = BASE + index as u32;
+            let proof = transaction_proof(&storage, block, height, tip);
+            assert_eq!(
+                proof.as_slice(),
+                transaction_proof(&one, block, height, tip).as_slice()
+            );
+            assert!(client
+                .verify_transaction(block.txdata[0].txid().as_ref(), proof.as_reader(), 0)
+                .is_ok());
+        }
+    }
+}
+
+#[test]
+fn reopening_storage_preserves_state_and_can_continue_appending() {
+    const BASE: u32 = 42;
+    let blocks = linked_blocks(10, 1);
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path()).unwrap();
+    let checkpoint = storage.initialize_with(BASE, blocks[0].header).unwrap();
+    storage
+        .append_headers(blocks[1..7].iter().map(|block| block.header).collect())
+        .unwrap();
+    let tip_before = storage.tip_state().unwrap();
+    let root_before = storage.generate_headers_root(tip_before.0).unwrap();
+    let proof_before = transaction_proof(&storage, &blocks[3], BASE + 3, tip_before.0);
+    drop(storage);
+
+    let reopened = Storage::new(directory.path()).unwrap();
+    assert!(reopened.is_initialized().unwrap());
+    assert_eq!(reopened.base_state().unwrap(), (BASE, blocks[0].header));
+    assert_eq!(reopened.tip_state().unwrap(), tip_before);
+    assert_eq!(
+        reopened
+            .generate_headers_root(tip_before.0)
+            .unwrap()
+            .as_slice(),
+        root_before.as_slice()
+    );
+    assert_eq!(
+        transaction_proof(&reopened, &blocks[3], BASE + 3, tip_before.0).as_slice(),
+        proof_before.as_slice()
+    );
+    let client = client_at_tip(&reopened, checkpoint.clone());
+    assert!(client
+        .verify_transaction(
+            blocks[3].txdata[0].txid().as_ref(),
+            proof_before.as_reader(),
+            1
+        )
+        .is_ok());
+
+    reopened
+        .append_headers(blocks[7..].iter().map(|block| block.header).collect())
+        .unwrap();
+    let reference_directory = tempfile::tempdir().unwrap();
+    let reference = Storage::new(reference_directory.path()).unwrap();
+    reference.initialize_with(BASE, blocks[0].header).unwrap();
+    reference
+        .append_headers(blocks[1..].iter().map(|block| block.header).collect())
+        .unwrap();
+    assert_eq!(
+        reopened.tip_state().unwrap(),
+        reference.tip_state().unwrap()
+    );
+    let tip = BASE + blocks.len() as u32 - 1;
+    assert_eq!(
+        reopened.generate_headers_root(tip).unwrap().as_slice(),
+        reference.generate_headers_root(tip).unwrap().as_slice()
+    );
+    let client = client_at_tip(&reopened, checkpoint);
+    for (index, block) in blocks.iter().enumerate() {
+        let proof = transaction_proof(&reopened, block, BASE + index as u32, tip);
+        assert!(client
+            .verify_transaction(block.txdata[0].txid().as_ref(), proof.as_reader(), 0)
+            .is_ok());
+    }
+}
+
+#[test]
+fn rollback_and_replace_branch_matches_fresh_storage() {
+    const BASE: u32 = 42;
+    let original = linked_blocks(10, 1);
+    // Keep the first four blocks, then replace a suffix spanning MMR peaks.
+    let mut replacement = original[..4].to_vec();
+    for index in 4..original.len() {
+        let mut block = original[index].clone();
+        block.header.prev_blockhash = replacement[index - 1].block_hash();
+        block.header.nonce = block.header.nonce.wrapping_add(100);
+        replacement.push(block);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path()).unwrap();
+    let checkpoint = storage.initialize_with(BASE, original[0].header).unwrap();
+    storage
+        .append_headers(original[1..].iter().map(|block| block.header).collect())
+        .unwrap();
+    let tip = BASE + original.len() as u32 - 1;
+    let old_proof = transaction_proof(&storage, &original[6], BASE + 6, tip);
+    let old_client = client_at_tip(&storage, checkpoint.clone());
+    assert!(old_client
+        .verify_transaction(
+            original[6].txdata[0].txid().as_ref(),
+            old_proof.as_reader(),
+            1
+        )
+        .is_ok());
+
+    storage.rollback_to(Some(BASE + 3)).unwrap();
+    assert_eq!(storage.tip_state().unwrap(), (BASE + 3, original[3].header));
+    storage
+        .append_headers(replacement[4..].iter().map(|block| block.header).collect())
+        .unwrap();
+    let reference_directory = tempfile::tempdir().unwrap();
+    let reference = Storage::new(reference_directory.path()).unwrap();
+    reference
+        .initialize_with(BASE, replacement[0].header)
+        .unwrap();
+    reference
+        .append_headers(replacement[1..].iter().map(|block| block.header).collect())
+        .unwrap();
+    assert_eq!(storage.tip_state().unwrap(), reference.tip_state().unwrap());
+    assert_eq!(
+        storage.generate_headers_root(tip).unwrap().as_slice(),
+        reference.generate_headers_root(tip).unwrap().as_slice()
+    );
+    let client = client_at_tip(&storage, checkpoint);
+    assert_ne!(
+        client.headers_mmr_root().as_slice(),
+        old_client.headers_mmr_root().as_slice()
+    );
+    for (index, block) in replacement.iter().enumerate() {
+        let height = BASE + index as u32;
+        let proof = transaction_proof(&storage, block, height, tip);
+        assert_eq!(
+            proof.as_slice(),
+            transaction_proof(&reference, block, height, tip).as_slice()
+        );
+        assert!(client
+            .verify_transaction(block.txdata[0].txid().as_ref(), proof.as_reader(), 0)
+            .is_ok());
+    }
+    assert_eq!(
+        client
+            .verify_transaction(
+                original[6].txdata[0].txid().as_ref(),
+                old_proof.as_reader(),
+                1
+            )
+            .map(|_| ())
+            .map_err(|error| error as i8),
+        Err(VerifyTxError::HeaderMmrProof as i8)
+    );
+}
