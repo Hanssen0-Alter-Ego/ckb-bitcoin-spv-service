@@ -13,7 +13,7 @@ env:
 jobs:
   rustfmt:
     name: Checks / Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout the Repository
         uses: actions/checkout@v4
@@ -25,7 +25,7 @@ jobs:
         run: make fmt
   clippy:
     name: Checks / Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout the Repository
         uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        os: [ ubuntu-24.04, macos-latest, windows-latest ]
       fail-fast: true
       max-parallel: 3
     steps:
