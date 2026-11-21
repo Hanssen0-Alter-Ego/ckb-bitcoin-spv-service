@@ -179,7 +179,8 @@ impl CkbRpcClientExtension for CkbRpcClient {
 }
 
 fn spv_cell_lookup_counts(clients_count: u8) -> (usize, u32) {
-    let expected = u32::from(clients_count) + 1; // One info cell plus the clients.
+    // One info cell plus the clients.
+    let expected = u32::from(clients_count) + 1;
     // Fetch one extra cell to detect an invalid count. At most 257 rows are requested,
     // well below the CKB Indexer's page limit.
     (expected as usize, expected + 1)
