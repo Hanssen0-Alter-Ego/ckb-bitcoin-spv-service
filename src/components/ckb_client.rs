@@ -160,12 +160,12 @@ impl CkbRpcClientExtension for CkbRpcClient {
         let order = Order::Desc;
         let search_key = SearchKey::from(query);
 
-        self.get_cells(search_key, order, u32::MAX.into(), None)
+        let (expected, limit) = spv_cell_lookup_counts(args.clients_count);
+        self.get_cells(search_key, order, limit.into(), None)
             .map_err(Into::into)
             .map(|res| res.objects)
             .and_then(|cells| {
                 let actual = cells.len();
-                let expected = usize::from(args.clients_count) + 1;
                 if actual == expected {
                     Ok(cells.into_iter().map(Into::into).collect())
                 } else {
@@ -176,6 +176,13 @@ impl CkbRpcClientExtension for CkbRpcClient {
                 }
             })
     }
+}
+
+fn spv_cell_lookup_counts(clients_count: u8) -> (usize, u32) {
+    let expected = u32::from(clients_count) + 1; // One info cell plus the clients.
+    // Fetch one extra cell to detect an invalid count. At most 257 rows are requested,
+    // well below the CKB Indexer's page limit.
+    (expected as usize, expected + 1)
 }
 
 impl SpvInstance {
@@ -280,5 +287,20 @@ fn parse_raw_spv_cells(cells: Vec<LiveCell>) -> Result<SpvInstance> {
     } else {
         let msg = "the SPV info cell is missing";
         Err(Error::other(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spv_cell_lookup_counts;
+
+    #[test]
+    fn spv_cell_lookup_requests_one_extra_cell() {
+        assert_eq!(spv_cell_lookup_counts(3), (4, 5));
+    }
+
+    #[test]
+    fn maximum_client_count_fits_in_a_single_indexer_page() {
+        assert_eq!(spv_cell_lookup_counts(u8::MAX), (256, 257));
     }
 }
