@@ -82,6 +82,7 @@ impl SpvInfoCell {
 
 pub trait CkbRpcClientExtension {
     fn dynamic_fee_rate(&self) -> Result<u64>;
+    fn prepare_transaction(&self, tx_json: &TransactionView) -> Result<H256>;
     fn send_transaction_ext(&self, tx_json: TransactionView, dry_run: bool) -> Result<H256>;
     fn find_raw_spv_cells(&self, spv_type_script: Script) -> Result<Vec<LiveCell>>;
 
@@ -116,9 +117,9 @@ impl CkbRpcClientExtension for CkbRpcClient {
             .map(Into::into)
     }
 
-    fn send_transaction_ext(&self, tx_json: TransactionView, dry_run: bool) -> Result<H256> {
+    fn prepare_transaction(&self, tx_json: &TransactionView) -> Result<H256> {
         if log::log_enabled!(log::Level::Trace) {
-            match serde_json::to_string_pretty(&tx_json) {
+            match serde_json::to_string_pretty(tx_json) {
                 Ok(tx_json_str) => {
                     log::trace!("transaction: {tx_json_str}")
                 }
@@ -136,6 +137,11 @@ impl CkbRpcClientExtension for CkbRpcClient {
             log::debug!("Estimated cycles for {tx_hash:#x}: {cycles}");
         }
 
+        Ok(tx_hash)
+    }
+
+    fn send_transaction_ext(&self, tx_json: TransactionView, dry_run: bool) -> Result<H256> {
+        let tx_hash = self.prepare_transaction(&tx_json)?;
         if !dry_run {
             let tx_hash = self.send_transaction(tx_json.inner, None)?;
             log::info!("Transaction hash: {tx_hash:#x}");

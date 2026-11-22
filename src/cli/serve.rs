@@ -14,9 +14,10 @@ use ckb_bitcoin_spv_verifier::types::{
     packed,
     prelude::Pack as VPack,
 };
-use ckb_jsonrpc_types::{Status, TransactionView};
+use ckb_jsonrpc_types::{Status, TransactionView, TxStatus};
 use ckb_sdk::{
     core::TransactionBuilder,
+    rpc::RpcError,
     transaction::{
         builder::{ChangeBuilder, DefaultChangeBuilder},
         handler::HandlerContexts,
@@ -53,6 +54,127 @@ use crate::{
 };
 
 const SPV_RESET_TIP_OFFSET: u32 = 1200;
+
+// CKB RPC's PoolRejectedDuplicatedTransaction code. Other RPC rejections are
+// definitive and must not be treated as successful submissions.
+const DUPLICATED_TRANSACTION: i64 = -1107;
+const MAX_UNCERTAIN_POLLS: u8 = 3;
+
+struct InFlight {
+    hash: H256,
+    consumed_info: OutPoint,
+    uncertain_polls: u8,
+}
+
+enum PreviousTx<T> {
+    Wait,
+    Retry,
+    Indexed(T),
+}
+
+fn ambiguous_send_error(error: &RpcError) -> bool {
+    match error {
+        RpcError::Http(_) | RpcError::Json(_) => true,
+        RpcError::Rpc(error) => matches!(error.code.code(), -1 | -32603),
+        RpcError::Other(_) => false,
+    }
+}
+
+impl InFlight {
+    fn from_send(
+        hash: H256,
+        consumed_info: OutPoint,
+        result: std::result::Result<H256, RpcError>,
+    ) -> Result<Self> {
+        match result {
+            Ok(reported) if reported == hash => {
+                log::info!("Transaction hash: {hash:#x}");
+                println!("Send transaction: {hash:#x}");
+            }
+            Ok(reported) => {
+                log::warn!(
+                    "CKB reported {reported:#x} instead of {hash:#x}; checking the local hash"
+                );
+            }
+            Err(RpcError::Rpc(error)) if error.code.code() == DUPLICATED_TRANSACTION => {
+                log::info!("CKB already knows transaction {hash:#x}; waiting for it");
+            }
+            // A lost or undecodable reply, or a generic internal error, does
+            // not establish whether the node accepted the transaction.
+            Err(error) if ambiguous_send_error(&error) => {
+                log::warn!("Uncertain submission for {hash:#x}: {error}; checking the local hash");
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Self {
+            hash,
+            consumed_info,
+            uncertain_polls: 0,
+        })
+    }
+
+    fn poll<T>(
+        &mut self,
+        status: impl FnOnce(H256) -> std::result::Result<TxStatus, RpcError>,
+        load_indexed: impl FnOnce() -> Result<(OutPoint, u64, T)>,
+    ) -> Result<PreviousTx<T>> {
+        let status = match status(self.hash.clone()) {
+            Ok(status) => status,
+            Err(error) => return self.failed_poll(error.into()),
+        };
+        let hash = &self.hash;
+        match status.status {
+            Status::Pending | Status::Proposed => {
+                self.uncertain_polls = 0;
+                log::debug!("Waiting for the previous transaction {hash:#x}");
+                Ok(PreviousTx::Wait)
+            }
+            Status::Committed => {
+                let (indexed_info, indexed_height, instance) = match load_indexed() {
+                    Ok(indexed) => indexed,
+                    Err(error) => return self.failed_poll(error),
+                };
+                self.uncertain_polls = 0;
+                let predates_commit = status
+                    .block_number
+                    .is_some_and(|height| indexed_height < u64::from(height));
+                if self.consumed_info == indexed_info || predates_commit {
+                    log::debug!("Waiting for the indexer to reflect transaction {hash:#x}");
+                    Ok(PreviousTx::Wait)
+                } else {
+                    // Use this exact indexed snapshot, without a second lookup.
+                    // A newer writer may already have spent our output.
+                    Ok(PreviousTx::Indexed(instance))
+                }
+            }
+            Status::Unknown => {
+                self.uncertain_polls += 1;
+                if self.uncertain_polls >= MAX_UNCERTAIN_POLLS {
+                    log::warn!("Transaction {hash:#x} is still unknown; reloading SPV state");
+                    Ok(PreviousTx::Retry)
+                } else {
+                    Ok(PreviousTx::Wait)
+                }
+            }
+            Status::Rejected => {
+                log::warn!("Transaction {hash:#x} was rejected; reloading SPV state");
+                Ok(PreviousTx::Retry)
+            }
+        }
+    }
+
+    fn failed_poll<T>(&mut self, error: Error) -> Result<PreviousTx<T>> {
+        self.uncertain_polls += 1;
+        if self.uncertain_polls >= MAX_UNCERTAIN_POLLS {
+            // Do not infer "not submitted" from RPC failures alone.
+            Err(error)
+        } else {
+            let hash = &self.hash;
+            log::warn!("Could not check transaction {hash:#x}: {error}; retrying");
+            Ok(PreviousTx::Wait)
+        }
+    }
+}
 
 #[derive(Parser)]
 pub struct Args {
@@ -141,35 +263,51 @@ impl Args {
 
         let _api_service = ApiServiceConfig::new(self.listen_address).start(spv_service.clone());
 
-        let mut prev_tx_hash: Option<H256> = None;
+        let mut in_flight: Option<InFlight> = None;
 
         loop {
             if !spv_service.sync_storage(self.bitcoin_headers_download_batch_size)? {
                 continue;
             }
 
-            if let Some(ref tx_hash) = prev_tx_hash {
-                let tx_status = ckb_cli
-                    .get_transaction_status(tx_hash.to_owned())?
-                    .tx_status
-                    .status;
-
-                match tx_status {
-                    Status::Pending | Status::Proposed => {
-                        // To avoid PoolRejectedDuplicatedTransaction
-                        log::debug!("Waiting for the previous transaction {tx_hash:#x}");
+            let instance = match in_flight.as_mut() {
+                None => spv_service.load_instance()?,
+                Some(tx) => match tx.poll(
+                    |hash| {
+                        ckb_cli
+                            .get_transaction_status(hash)
+                            .map(|result| result.tx_status)
+                    },
+                    || {
+                        let instance = spv_service.load_instance()?;
+                        Ok((
+                            instance.info.cell.out_point.clone(),
+                            instance.info.cell.block_number,
+                            instance,
+                        ))
+                    },
+                )? {
+                    PreviousTx::Wait => {
                         self.take_a_break();
                         continue;
                     }
-                    Status::Committed | Status::Unknown | Status::Rejected => {}
-                }
-            }
+                    PreviousTx::Retry => {
+                        in_flight = None;
+                        self.take_a_break();
+                        spv_service.load_instance()?
+                    }
+                    PreviousTx::Indexed(instance) => {
+                        in_flight = None;
+                        instance
+                    }
+                },
+            };
 
             let (stg_tip_height, stg_tip_header) = spv_service.storage.tip_state()?;
             let stg_tip_hash = stg_tip_header.block_hash();
             log::info!("[storage] header#{stg_tip_height:07}, {stg_tip_hash:#x}; tip");
 
-            match spv_service.select_operation()? {
+            let (operation, result) = match spv_service.select_operation(instance)? {
                 SpvOperation::Update(input) => {
                     let spv_tip_height = input.curr.client.headers_mmr_root.max_height;
 
@@ -190,14 +328,10 @@ impl Args {
                         input.info.get_flags()?,
                     )?;
 
-                    let tx_hash =
-                        self.update_spv_cells(&spv_service, input, spv_client, spv_update);
-
-                    if let Err(e) = &tx_hash {
-                        log::warn!("Failed to update SPV instance: {:?}", e);
-                    }
-
-                    prev_tx_hash = tx_hash.ok();
+                    (
+                        "update",
+                        self.update_spv_cells(&spv_service, input, spv_client, spv_update),
+                    )
                 }
                 SpvOperation::Reorg(input) => {
                     log::info!("Try to reorg SPV instance");
@@ -212,13 +346,10 @@ impl Args {
                     let (spv_client, spv_update) =
                         storage.generate_spv_client_and_spv_update(spv_tip_height, limit, flags)?;
 
-                    let tx_hash = self.reorg_spv_cells(&spv_service, input, spv_client, spv_update);
-
-                    if let Err(e) = &tx_hash {
-                        log::warn!("Failed to reorg SPV instance: {:?}", e);
-                    }
-
-                    prev_tx_hash = tx_hash.ok();
+                    (
+                        "reorg",
+                        self.reorg_spv_cells(&spv_service, input, spv_client, spv_update),
+                    )
                 }
                 SpvOperation::Reset(input) => {
                     let flags = input.info.get_flags()?;
@@ -243,13 +374,18 @@ impl Args {
                         flags,
                     )?;
 
-                    let tx_hash = self.reorg_spv_cells(&spv_service, input, spv_client, spv_update);
-
-                    if let Err(e) = &tx_hash {
-                        log::warn!("Failed to reset SPV instance: {:?}", e);
-                    }
-
-                    prev_tx_hash = tx_hash.ok();
+                    (
+                        "reset",
+                        self.reorg_spv_cells(&spv_service, input, spv_client, spv_update),
+                    )
+                }
+            };
+            match result {
+                Ok(Some(tx)) => in_flight = Some(tx),
+                Ok(None) => self.take_a_break(), // Dry run never enters transaction tracking.
+                Err(error) => {
+                    log::warn!("Failed to {operation} SPV instance: {error}");
+                    self.take_a_break();
                 }
             }
         }
@@ -257,13 +393,13 @@ impl Args {
         // TODO Handle Ctrl-C and clean resources before exit.
     }
 
-    pub(crate) fn update_spv_cells(
+    fn update_spv_cells(
         &self,
         spv: &SpvService,
         update_input: SpvUpdateInput,
         mut spv_client: SpvClient,
         spv_update: packed::SpvUpdate,
-    ) -> Result<H256> {
+    ) -> Result<Option<InFlight>> {
         let network_info =
             NetworkInfo::new(self.ckb.network, self.ckb.ckb_endpoint.as_str().to_owned());
         let configuration = {
@@ -505,21 +641,16 @@ impl Args {
         )?;
 
         let tx_json = TransactionView::from(tx_with_groups.get_tx_view().clone());
-        let tx_hash = self
-            .ckb
-            .client()
-            .send_transaction_ext(tx_json, self.dry_run)?;
-
-        Ok(tx_hash)
+        self.submit_spv_transaction(spv, tx_json, update_input.info.cell.out_point)
     }
 
-    pub(crate) fn reorg_spv_cells(
+    fn reorg_spv_cells(
         &self,
         spv: &SpvService,
         reorg_input: SpvReorgInput,
         mut spv_client: SpvClient,
         spv_update: packed::SpvUpdate,
-    ) -> Result<H256> {
+    ) -> Result<Option<InFlight>> {
         let network_info =
             NetworkInfo::new(self.ckb.network, self.ckb.ckb_endpoint.as_str().to_owned());
         let configuration = {
@@ -781,15 +912,168 @@ impl Args {
         )?;
 
         let tx_json = TransactionView::from(tx_with_groups.get_tx_view().clone());
-        let tx_hash = self
-            .ckb
-            .client()
-            .send_transaction_ext(tx_json, self.dry_run)?;
+        self.submit_spv_transaction(spv, tx_json, reorg_input.info.cell.out_point)
+    }
 
-        Ok(tx_hash)
+    fn submit_spv_transaction(
+        &self,
+        spv: &SpvService,
+        tx_json: TransactionView,
+        consumed_info: OutPoint,
+    ) -> Result<Option<InFlight>> {
+        // Estimation, if enabled, happens before sending. An estimation error is
+        // not evidence of a submission, even if it was a transport failure.
+        let hash = spv.ckb_cli.prepare_transaction(&tx_json)?;
+        if self.dry_run {
+            return Ok(None);
+        }
+        InFlight::from_send(
+            hash,
+            consumed_info,
+            spv.ckb_cli.send_transaction(tx_json.inner, None),
+        )
+        .map(Some)
     }
 
     fn take_a_break(&self) {
-        thread::sleep(time::Duration::from_secs(self.interval));
+        thread::sleep(time::Duration::from_secs(self.interval.max(1)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outpoint(byte: u8) -> OutPoint {
+        let hash = H256([byte; 32]);
+        OutPoint::new_builder().tx_hash(hash.pack()).build()
+    }
+
+    fn status(state: Status) -> TxStatus {
+        TxStatus {
+            block_number: (state == Status::Committed).then_some(100u64.into()),
+            status: state,
+            block_hash: None,
+            reason: None,
+        }
+    }
+
+    fn rpc_error(code: i64) -> RpcError {
+        RpcError::Rpc(jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::ServerError(code),
+            message: "test RPC response".into(),
+            data: None,
+        })
+    }
+
+    fn tracked() -> InFlight {
+        let hash = H256([42; 32]);
+        InFlight::from_send(hash.clone(), outpoint(1), Ok(hash)).unwrap()
+    }
+
+    fn no_indexer() -> Result<(OutPoint, u64, ())> {
+        panic!("indexer must not be queried while the transaction is uncommitted")
+    }
+
+    #[test]
+    fn duplicate_and_ambiguous_send_keep_the_locally_computed_hash() {
+        let hash = H256([42; 32]);
+        let bad_json = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        for response in [
+            Err(rpc_error(DUPLICATED_TRANSACTION)),
+            Err(RpcError::Json(bad_json)),
+            Err(rpc_error(-1)),
+            Ok(H256([7; 32])),
+        ] {
+            let mut tx = InFlight::from_send(hash.clone(), outpoint(1), response).unwrap();
+            assert!(matches!(
+                tx.poll(
+                    |request_hash| {
+                        assert_eq!(request_hash, hash);
+                        Ok(status(Status::Pending))
+                    },
+                    no_indexer
+                ),
+                Ok(PreviousTx::Wait),
+            ));
+        }
+        assert!(InFlight::from_send(hash, outpoint(1), Err(rpc_error(-1104))).is_err());
+    }
+
+    #[test]
+    fn committed_transaction_waits_for_the_indexed_cells_not_the_node_alone() {
+        let mut tx = tracked();
+        for state in [Status::Pending, Status::Proposed] {
+            assert!(matches!(
+                tx.poll(|_| Ok(status(state)), no_indexer),
+                Ok(PreviousTx::Wait)
+            ));
+        }
+
+        for (cell, height) in [(outpoint(1), 100), (outpoint(3), 98)] {
+            assert!(matches!(
+                tx.poll(|_| Ok(status(Status::Committed)), || Ok((cell, height, ()))),
+                Ok(PreviousTx::Wait),
+            ));
+        }
+        assert!(matches!(
+            tx.poll(
+                |_| Ok(status(Status::Committed)),
+                || Ok((outpoint(2), 101, "fresh snapshot"))
+            ),
+            Ok(PreviousTx::Indexed("fresh snapshot")),
+        ));
+    }
+
+    #[test]
+    fn reorg_rechecks_status_and_unknown_is_bounded() {
+        let mut tx = tracked();
+        assert!(matches!(
+            tx.poll(
+                |_| Ok(status(Status::Committed)),
+                || Ok((outpoint(1), 99, ()))
+            ),
+            Ok(PreviousTx::Wait),
+        ));
+        assert!(matches!(
+            tx.poll(|_| Ok(status(Status::Pending)), no_indexer),
+            Ok(PreviousTx::Wait),
+        ));
+        for _ in 0..(MAX_UNCERTAIN_POLLS - 1) {
+            assert!(matches!(
+                tx.poll(|_| Ok(status(Status::Unknown)), no_indexer),
+                Ok(PreviousTx::Wait),
+            ));
+        }
+        assert!(matches!(
+            tx.poll(|_| Ok(status(Status::Unknown)), no_indexer),
+            Ok(PreviousTx::Retry),
+        ));
+    }
+
+    #[test]
+    fn status_and_indexer_failures_back_off_without_releasing_the_transaction() {
+        let mut tx = tracked();
+        assert!(matches!(
+            tx.poll(|_| Err(rpc_error(-1)), no_indexer),
+            Ok(PreviousTx::Wait),
+        ));
+        assert!(matches!(
+            tx.poll::<()>(
+                |_| Ok(status(Status::Committed)),
+                || Err(Error::other("indexer temporarily unavailable"))
+            ),
+            Ok(PreviousTx::Wait),
+        ));
+        assert!(tx.poll(|_| Err(rpc_error(-1)), no_indexer).is_err());
+    }
+
+    #[test]
+    fn definitive_rejection_releases_tracking() {
+        let mut tx = tracked();
+        assert!(matches!(
+            tx.poll(|_| Ok(status(Status::Rejected)), no_indexer),
+            Ok(PreviousTx::Retry),
+        ));
     }
 }
