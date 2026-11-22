@@ -36,6 +36,30 @@ With the command line option `-h`(alias of `--help`), help will be printed.
 
 ### JSON-RPC API Reference
 
+- Method `getSyncStatus` (no arguments)
+
+  Returns the last observations from the synchronization loop. The request does
+  not query either node or read the local database.
+
+  - `bitcoinTip`: `{height, observedAt}` for the configured Bitcoin node's tip.
+  - `localHeaderTip`: `{height, observedAt}` for the service's stored header tip.
+  - `confirmedClient`: `{startHeight, endHeight, observedAt}` for the active
+    client selected by the SPV info cell in the CKB Indexer. Both heights are
+    **Bitcoin** heights. A pending update does not advance this observation.
+
+  Each field is `null` until observed. In `watch` mode, `confirmedClient` is
+  always `null` because that command does not load the SPV instance in its
+  synchronization loop. `observedAt` is Unix time in seconds (or `null` if
+  the system clock is before the Unix epoch). Observations update independently;
+  check their timestamps before comparing heights. This method does not test
+  whether a specific transaction proof is available.
+
+  ```sh
+  curl -X POST -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","method":"getSyncStatus","params":[],"id":1}' \
+    http://127.0.0.1:8888
+  ```
+
 - Method `getTxProof`
 
   Arguments:
