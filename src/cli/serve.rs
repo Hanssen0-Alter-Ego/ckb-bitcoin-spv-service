@@ -212,6 +212,7 @@ impl Args {
             ckb_cli: ckb_cli.clone(),
             btc_cli: btc_cli.clone(),
             storage: storage.clone(),
+            sync_status: Default::default(),
         };
 
         let _api_service = ApiServiceConfig::new(self.listen_address).start(spv_service.clone());

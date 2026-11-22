@@ -21,6 +21,8 @@ use crate::{
     result::{Error, Result},
 };
 
+use super::sync_status::SyncStatus;
+
 mod error;
 
 pub use error::ApiErrorCode;
@@ -40,6 +42,9 @@ pub struct BitcoinTxProof {
 
 #[rpc(server)]
 pub trait SpvRpc {
+    #[rpc(name = "getSyncStatus")]
+    fn get_sync_status(&self) -> RpcResult<SyncStatus>;
+
     #[rpc(name = "getTxProof")]
     fn get_tx_proof(
         &self,
@@ -174,6 +179,10 @@ impl SpvRpcImpl {
 }
 
 impl SpvRpc for SpvRpcImpl {
+    fn get_sync_status(&self) -> RpcResult<SyncStatus> {
+        Ok(self.spv_service.sync_status.snapshot())
+    }
+
     fn get_tx_proof(
         &self,
         txid: Txid,
@@ -437,5 +446,67 @@ impl SpvRpc for SpvRpcImpl {
             proof: JsonBytes::from_bytes(tx_proof),
         };
         Ok(btc_tx_proof)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ckb_sdk::rpc::CkbRpcClient;
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::components::{BitcoinClient, Storage};
+
+    #[test]
+    fn sync_status_reads_only_the_shared_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = "http://127.0.0.1:1";
+        let service = SpvService {
+            ckb_cli: CkbRpcClient::new(endpoint),
+            btc_cli: BitcoinClient::new(endpoint.parse().unwrap(), None, None),
+            storage: Storage::new(directory.path()).unwrap(),
+            sync_status: Default::default(),
+        };
+        let observations = service.sync_status.clone();
+        let mut rpc = IoHandler::new();
+        rpc.extend_with(SpvRpcImpl::new(service).to_delegate());
+
+        let status = || -> Value {
+            let response = rpc
+                .handle_request_sync(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"getSyncStatus","params":[]}"#,
+                )
+                .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], 1);
+            response["result"].clone()
+        };
+
+        // No initialized storage or connected upstreams are needed, including
+        // while the synchronization loop has only observed some of its inputs.
+        assert_eq!(
+            status(),
+            json!({"bitcoinTip": null, "localHeaderTip": null, "confirmedClient": null}),
+        );
+        observations.observe_bitcoin_tip(105);
+        observations.observe_local_tip(101);
+        let partial = status();
+        assert_eq!(partial["bitcoinTip"]["height"], 105);
+        assert!(partial["bitcoinTip"]["observedAt"].as_u64().is_some());
+        assert_eq!(partial["localHeaderTip"]["height"], 101);
+        assert!(partial["localHeaderTip"]["observedAt"].as_u64().is_some());
+        assert!(partial["confirmedClient"].is_null());
+
+        observations.observe_confirmed_client(50, 98);
+        observations.observe_local_tip(97);
+        let after_rollback = status();
+        assert_eq!(after_rollback["localHeaderTip"]["height"], 97);
+        assert_eq!(after_rollback["confirmedClient"]["startHeight"], 50);
+        assert_eq!(after_rollback["confirmedClient"]["endHeight"], 98);
+        assert!(after_rollback["confirmedClient"]["observedAt"]
+            .as_u64()
+            .is_some());
+        assert_eq!(after_rollback["bitcoinTip"], partial["bitcoinTip"]);
+        assert_eq!(status(), after_rollback);
     }
 }

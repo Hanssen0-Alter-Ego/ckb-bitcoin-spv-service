@@ -6,6 +6,7 @@ pub(crate) mod storage;
 
 mod api_service;
 mod spv_service;
+mod sync_status;
 
 pub use api_service::ApiServiceConfig;
 pub use bitcoin_client::BitcoinClient;

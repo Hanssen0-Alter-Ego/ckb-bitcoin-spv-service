@@ -14,11 +14,14 @@ use crate::{
     result::{Error, Result},
 };
 
+use super::sync_status::SyncStatusCache;
+
 #[derive(Clone)]
 pub struct SpvService {
     pub(crate) ckb_cli: CkbRpcClient,
     pub(crate) btc_cli: BitcoinClient,
     pub(crate) storage: Storage,
+    pub(crate) sync_status: SyncStatusCache,
 }
 
 pub struct SpvUpdateInput {
@@ -42,7 +45,13 @@ pub enum SpvOperation {
 impl SpvService {
     pub(crate) fn load_instance(&self) -> Result<SpvInstance> {
         let spv_type_script = self.storage.spv_contract_type_script()?;
-        self.ckb_cli.find_spv_cells(spv_type_script)
+        let instance = self.ckb_cli.find_spv_cells(spv_type_script)?;
+        if let Some(cell) = instance.clients.get(&instance.info.info.tip_client_id) {
+            let range = &cell.client.headers_mmr_root;
+            self.sync_status
+                .observe_confirmed_client(range.min_height, range.max_height);
+        }
+        Ok(instance)
     }
 
     pub(crate) fn select_operation(&self, ins: SpvInstance) -> Result<SpvOperation> {
@@ -151,10 +160,12 @@ impl SpvService {
     pub(crate) fn sync_storage(&self, batch_size: u32) -> Result<bool> {
         let spv = &self;
         let (stg_tip_height, stg_tip_header) = spv.storage.tip_state()?;
+        self.sync_status.observe_local_tip(stg_tip_height);
         let stg_tip_hash = stg_tip_header.block_hash();
         log::info!("[storage] header#{stg_tip_height:07}, {stg_tip_hash:#x}; tip");
 
         let (btc_tip_height, btc_tip_header) = spv.btc_cli.get_tip_state()?;
+        self.sync_status.observe_bitcoin_tip(btc_tip_height);
         log::info!(
             "[bitcoin] header#{btc_tip_height:07}, {:#x}; tip; prev {:#x}",
             btc_tip_header.block_hash(),
@@ -206,6 +217,7 @@ impl SpvService {
 
         log::warn!("The chain in storage rollback to header#{fork_height:07}, {fork_hash:#x}");
         spv.storage.rollback_to(Some(fork_height))?;
+        self.sync_status.observe_local_tip(fork_height);
 
         let headers_opt = self.sync_storage_internal(
             batch_size,
@@ -247,7 +259,8 @@ impl SpvService {
                 return Ok(None);
             }
             headers.extend_from_slice(&tmp_headers);
-            let _ = spv.storage.append_headers(tmp_headers)?;
+            let (height, _) = spv.storage.append_headers(tmp_headers)?;
+            self.sync_status.observe_local_tip(height);
         }
         Ok(Some(headers))
     }
