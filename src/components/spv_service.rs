@@ -40,9 +40,12 @@ pub enum SpvOperation {
 }
 
 impl SpvService {
-    pub(crate) fn select_operation(&self) -> Result<SpvOperation> {
+    pub(crate) fn load_instance(&self) -> Result<SpvInstance> {
         let spv_type_script = self.storage.spv_contract_type_script()?;
-        let ins = self.ckb_cli.find_spv_cells(spv_type_script)?;
+        self.ckb_cli.find_spv_cells(spv_type_script)
+    }
+
+    pub(crate) fn select_operation(&self, ins: SpvInstance) -> Result<SpvOperation> {
         let spv_client_curr = ins
             .clients
             .get(&ins.info.info.tip_client_id)
