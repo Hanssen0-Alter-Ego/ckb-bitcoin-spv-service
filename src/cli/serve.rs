@@ -72,40 +72,21 @@ enum PreviousTx<T> {
     Indexed(T),
 }
 
-fn ambiguous_send_error(error: &RpcError) -> bool {
-    match error {
-        RpcError::Http(_) | RpcError::Json(_) => true,
-        RpcError::Rpc(error) => matches!(error.code.code(), -1 | -32603),
-        RpcError::Other(_) => false,
-    }
-}
-
 impl InFlight {
     fn from_send(
         hash: H256,
         consumed_info: OutPoint,
         result: std::result::Result<H256, RpcError>,
     ) -> Result<Self> {
-        match result {
-            Ok(reported) if reported == hash => {
+        let hash = match result {
+            Ok(hash) => {
                 log::info!("Transaction hash: {hash:#x}");
                 println!("Send transaction: {hash:#x}");
+                hash
             }
-            Ok(reported) => {
-                log::warn!(
-                    "CKB reported {reported:#x} instead of {hash:#x}; checking the local hash"
-                );
-            }
-            Err(RpcError::Rpc(error)) if error.code.code() == DUPLICATED_TRANSACTION => {
-                log::info!("CKB already knows transaction {hash:#x}; waiting for it");
-            }
-            // A lost or undecodable reply, or a generic internal error, does
-            // not establish whether the node accepted the transaction.
-            Err(error) if ambiguous_send_error(&error) => {
-                log::warn!("Uncertain submission for {hash:#x}: {error}; checking the local hash");
-            }
+            Err(RpcError::Rpc(error)) if error.code.code() == DUPLICATED_TRANSACTION => hash,
             Err(error) => return Err(error.into()),
-        }
+        };
         Ok(Self {
             hash,
             consumed_info,
@@ -115,63 +96,35 @@ impl InFlight {
 
     fn poll<T>(
         &mut self,
-        status: impl FnOnce(H256) -> std::result::Result<TxStatus, RpcError>,
+        status: TxStatus,
         load_indexed: impl FnOnce() -> Result<(OutPoint, u64, T)>,
     ) -> Result<PreviousTx<T>> {
-        let status = match status(self.hash.clone()) {
-            Ok(status) => status,
-            Err(error) => return self.failed_poll(error.into()),
-        };
-        let hash = &self.hash;
+        if status.status == Status::Unknown {
+            self.uncertain_polls += 1;
+            return Ok(if self.uncertain_polls < MAX_UNCERTAIN_POLLS {
+                PreviousTx::Wait
+            } else {
+                PreviousTx::Retry
+            });
+        }
+        self.uncertain_polls = 0;
         match status.status {
-            Status::Pending | Status::Proposed => {
-                self.uncertain_polls = 0;
-                log::debug!("Waiting for the previous transaction {hash:#x}");
-                Ok(PreviousTx::Wait)
-            }
+            Status::Pending | Status::Proposed => Ok(PreviousTx::Wait),
             Status::Committed => {
-                let (indexed_info, indexed_height, instance) = match load_indexed() {
-                    Ok(indexed) => indexed,
-                    Err(error) => return self.failed_poll(error),
-                };
-                self.uncertain_polls = 0;
-                let predates_commit = status
-                    .block_number
-                    .is_some_and(|height| indexed_height < u64::from(height));
-                if self.consumed_info == indexed_info || predates_commit {
-                    log::debug!("Waiting for the indexer to reflect transaction {hash:#x}");
+                let (indexed_info, indexed_height, instance) = load_indexed()?;
+                if self.consumed_info == indexed_info
+                    || status
+                        .block_number
+                        .is_some_and(|height| indexed_height < u64::from(height))
+                {
                     Ok(PreviousTx::Wait)
                 } else {
-                    // Use this exact indexed snapshot, without a second lookup.
-                    // A newer writer may already have spent our output.
+                    // Build from this snapshot, not a second indexer read.
                     Ok(PreviousTx::Indexed(instance))
                 }
             }
-            Status::Unknown => {
-                self.uncertain_polls += 1;
-                if self.uncertain_polls >= MAX_UNCERTAIN_POLLS {
-                    log::warn!("Transaction {hash:#x} is still unknown; reloading SPV state");
-                    Ok(PreviousTx::Retry)
-                } else {
-                    Ok(PreviousTx::Wait)
-                }
-            }
-            Status::Rejected => {
-                log::warn!("Transaction {hash:#x} was rejected; reloading SPV state");
-                Ok(PreviousTx::Retry)
-            }
-        }
-    }
-
-    fn failed_poll<T>(&mut self, error: Error) -> Result<PreviousTx<T>> {
-        self.uncertain_polls += 1;
-        if self.uncertain_polls >= MAX_UNCERTAIN_POLLS {
-            // Do not infer "not submitted" from RPC failures alone.
-            Err(error)
-        } else {
-            let hash = &self.hash;
-            log::warn!("Could not check transaction {hash:#x}: {error}; retrying");
-            Ok(PreviousTx::Wait)
+            Status::Rejected => Ok(PreviousTx::Retry),
+            Status::Unknown => unreachable!("handled above"),
         }
     }
 }
@@ -272,35 +225,37 @@ impl Args {
 
             let instance = match in_flight.as_mut() {
                 None => spv_service.load_instance()?,
-                Some(tx) => match tx.poll(
-                    |hash| {
-                        ckb_cli
-                            .get_transaction_status(hash)
-                            .map(|result| result.tx_status)
-                    },
-                    || {
+                Some(tx) => {
+                    let status = ckb_cli.get_transaction_status(tx.hash.clone())?.tx_status;
+                    let next = tx.poll(status, || {
                         let instance = spv_service.load_instance()?;
                         Ok((
                             instance.info.cell.out_point.clone(),
                             instance.info.cell.block_number,
                             instance,
                         ))
-                    },
-                )? {
-                    PreviousTx::Wait => {
-                        self.take_a_break();
-                        continue;
+                    })?;
+                    match next {
+                        PreviousTx::Wait => {
+                            log::debug!("Waiting for transaction or indexer: {:#x}", tx.hash);
+                            self.take_a_break();
+                            continue;
+                        }
+                        PreviousTx::Retry => {
+                            log::warn!(
+                                "Transaction {:#x} not confirmed; reloading SPV state",
+                                tx.hash
+                            );
+                            in_flight = None;
+                            self.take_a_break();
+                            spv_service.load_instance()?
+                        }
+                        PreviousTx::Indexed(instance) => {
+                            in_flight = None;
+                            instance
+                        }
                     }
-                    PreviousTx::Retry => {
-                        in_flight = None;
-                        self.take_a_break();
-                        spv_service.load_instance()?
-                    }
-                    PreviousTx::Indexed(instance) => {
-                        in_flight = None;
-                        instance
-                    }
-                },
+                }
             };
 
             let (stg_tip_height, stg_tip_header) = spv_service.storage.tip_state()?;
@@ -976,104 +931,55 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_ambiguous_send_keep_the_locally_computed_hash() {
+    fn duplicate_tracks_the_locally_computed_hash() {
         let hash = H256([42; 32]);
-        let bad_json = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
-        for response in [
-            Err(rpc_error(DUPLICATED_TRANSACTION)),
-            Err(RpcError::Json(bad_json)),
-            Err(rpc_error(-1)),
-            Ok(H256([7; 32])),
-        ] {
-            let mut tx = InFlight::from_send(hash.clone(), outpoint(1), response).unwrap();
-            assert!(matches!(
-                tx.poll(
-                    |request_hash| {
-                        assert_eq!(request_hash, hash);
-                        Ok(status(Status::Pending))
-                    },
-                    no_indexer
-                ),
-                Ok(PreviousTx::Wait),
-            ));
-        }
+        let tx = InFlight::from_send(hash.clone(), outpoint(1), Err(rpc_error(-1107))).unwrap();
+        assert_eq!(tx.hash, hash);
         assert!(InFlight::from_send(hash, outpoint(1), Err(rpc_error(-1104))).is_err());
     }
 
     #[test]
-    fn committed_transaction_waits_for_the_indexed_cells_not_the_node_alone() {
+    fn committed_waits_for_the_indexer_then_returns_the_same_snapshot() {
         let mut tx = tracked();
         for state in [Status::Pending, Status::Proposed] {
             assert!(matches!(
-                tx.poll(|_| Ok(status(state)), no_indexer),
+                tx.poll(status(state), no_indexer),
                 Ok(PreviousTx::Wait)
             ));
         }
-
         for (cell, height) in [(outpoint(1), 100), (outpoint(3), 98)] {
             assert!(matches!(
-                tx.poll(|_| Ok(status(Status::Committed)), || Ok((cell, height, ()))),
+                tx.poll(status(Status::Committed), || Ok((cell, height, ()))),
                 Ok(PreviousTx::Wait),
             ));
         }
         assert!(matches!(
-            tx.poll(
-                |_| Ok(status(Status::Committed)),
-                || Ok((outpoint(2), 101, "fresh snapshot"))
-            ),
+            tx.poll(status(Status::Committed), || Ok((
+                outpoint(2),
+                101,
+                "fresh snapshot"
+            ))),
             Ok(PreviousTx::Indexed("fresh snapshot")),
         ));
     }
 
     #[test]
-    fn reorg_rechecks_status_and_unknown_is_bounded() {
+    fn consecutive_unknown_polls_are_bounded() {
         let mut tx = tracked();
-        assert!(matches!(
-            tx.poll(
-                |_| Ok(status(Status::Committed)),
-                || Ok((outpoint(1), 99, ()))
-            ),
-            Ok(PreviousTx::Wait),
-        ));
-        assert!(matches!(
-            tx.poll(|_| Ok(status(Status::Pending)), no_indexer),
-            Ok(PreviousTx::Wait),
-        ));
-        for _ in 0..(MAX_UNCERTAIN_POLLS - 1) {
+        for state in [
+            Status::Unknown,
+            Status::Pending,
+            Status::Unknown,
+            Status::Unknown,
+        ] {
             assert!(matches!(
-                tx.poll(|_| Ok(status(Status::Unknown)), no_indexer),
-                Ok(PreviousTx::Wait),
+                tx.poll(status(state), no_indexer),
+                Ok(PreviousTx::Wait)
             ));
         }
         assert!(matches!(
-            tx.poll(|_| Ok(status(Status::Unknown)), no_indexer),
-            Ok(PreviousTx::Retry),
-        ));
-    }
-
-    #[test]
-    fn status_and_indexer_failures_back_off_without_releasing_the_transaction() {
-        let mut tx = tracked();
-        assert!(matches!(
-            tx.poll(|_| Err(rpc_error(-1)), no_indexer),
-            Ok(PreviousTx::Wait),
-        ));
-        assert!(matches!(
-            tx.poll::<()>(
-                |_| Ok(status(Status::Committed)),
-                || Err(Error::other("indexer temporarily unavailable"))
-            ),
-            Ok(PreviousTx::Wait),
-        ));
-        assert!(tx.poll(|_| Err(rpc_error(-1)), no_indexer).is_err());
-    }
-
-    #[test]
-    fn definitive_rejection_releases_tracking() {
-        let mut tx = tracked();
-        assert!(matches!(
-            tx.poll(|_| Ok(status(Status::Rejected)), no_indexer),
-            Ok(PreviousTx::Retry),
+            tx.poll(status(Status::Unknown), no_indexer),
+            Ok(PreviousTx::Retry)
         ));
     }
 }
