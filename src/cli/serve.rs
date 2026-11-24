@@ -49,7 +49,7 @@ use crate::{
     },
     constants,
     prelude::*,
-    result::{Error, Result},
+    result::{BtcRpcError, Error, Result},
     utilities::{try_raise_fd_limit, value_parsers},
 };
 
@@ -59,6 +59,22 @@ const SPV_RESET_TIP_OFFSET: u32 = 1200;
 // definitive and must not be treated as successful submissions.
 const DUPLICATED_TRANSACTION: i64 = -1107;
 const MAX_UNCERTAIN_POLLS: u8 = 3;
+
+fn storage_sync_can_proceed(result: Result<bool>, wait: impl FnOnce()) -> Result<bool> {
+    match result {
+        Err(Error::BitRpc(BtcRpcError::Http(error)))
+            if error.is_connect() || error.is_timeout() || error.is_request() || error.is_body() =>
+        {
+            // Do not run any CKB operations until Bitcoin storage is synchronized again.
+            log::warn!(
+                "Bitcoin RPC transport error while syncing headers; retrying after the poll interval: {error}"
+            );
+            wait();
+            Ok(false)
+        }
+        result => result,
+    }
+}
 
 struct InFlight {
     hash: H256,
@@ -220,7 +236,10 @@ impl Args {
         let mut in_flight: Option<InFlight> = None;
 
         loop {
-            if !spv_service.sync_storage(self.bitcoin_headers_download_batch_size)? {
+            if !storage_sync_can_proceed(
+                spv_service.sync_storage(self.bitcoin_headers_download_batch_size),
+                || self.take_a_break(),
+            )? {
                 continue;
             }
 
@@ -929,6 +948,71 @@ mod tests {
 
     fn no_indexer() -> Result<(OutPoint, u64, ())> {
         panic!("indexer must not be queried while the transaction is uncommitted")
+    }
+
+    #[test]
+    fn bitcoin_transport_error_waits_then_allows_a_successful_poll() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            // Model a peer disconnecting immediately after accepting a connection.
+            drop(listener.accept().unwrap().0);
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            loop {
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let poll = || -> Result<bool> {
+            client
+                .post(&endpoint)
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .map_err(BtcRpcError::from)?;
+            Ok(true)
+        };
+        let mut waits = 0;
+        assert!(!storage_sync_can_proceed(poll(), || waits += 1).unwrap());
+        assert!(storage_sync_can_proceed(poll(), || waits += 1).unwrap());
+        assert_eq!(waits, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn permanent_storage_sync_errors_still_propagate() {
+        let no_wait = || panic!("non-transport outcomes must not trigger a retry wait");
+        let rpc = BtcRpcError::from(jsonrpc_core::Error::invalid_params("test"));
+        assert!(matches!(
+            storage_sync_can_proceed(Err(rpc.into()), no_wait),
+            Err(Error::BitRpc(BtcRpcError::Rpc(_)))
+        ));
+        assert!(matches!(
+            storage_sync_can_proceed(Err(Error::other("test")), no_wait),
+            Err(Error::Other(_))
+        ));
+        assert!(!storage_sync_can_proceed(Ok(false), no_wait).unwrap());
     }
 
     #[test]
