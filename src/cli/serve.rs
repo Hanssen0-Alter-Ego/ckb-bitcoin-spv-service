@@ -74,6 +74,10 @@ fn is_retryable_io(kind: io::ErrorKind) -> bool {
     )
 }
 
+fn is_retryable_hyper(error: &hyper::Error) -> bool {
+    error.is_closed() || error.is_incomplete_message()
+}
+
 fn is_retryable_transport(error: &reqwest::Error) -> bool {
     if error.is_timeout() {
         return true;
@@ -85,7 +89,7 @@ fn is_retryable_transport(error: &reqwest::Error) -> bool {
     while let Some(inner) = cause {
         if inner
             .downcast_ref::<hyper::Error>()
-            .is_some_and(hyper::Error::is_incomplete_message)
+            .is_some_and(is_retryable_hyper)
             || inner
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| is_retryable_io(error.kind()))
@@ -985,6 +989,15 @@ mod tests {
         panic!("indexer must not be queried while the transaction is uncommitted")
     }
 
+    #[tokio::test]
+    async fn closed_hyper_channel_is_retryable() {
+        let (mut sender, body) = hyper::Body::channel();
+        drop(body);
+        let error = sender.send_data("test".into()).await.unwrap_err();
+        assert!(error.is_closed());
+        assert!(is_retryable_hyper(&error));
+    }
+
     #[test]
     fn repeated_bitcoin_disconnects_wait_then_allow_a_successful_poll() {
         use std::{
@@ -995,11 +1008,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            // Model a peer disconnecting immediately after accepting a connection.
-            for _ in 0..2 {
-                drop(listener.accept().unwrap().0);
-            }
-            for status in ["200 OK", "401 Unauthorized"] {
+            for status in [None, None, Some("200 OK"), Some("401 Unauthorized")] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(time::Duration::from_secs(5)))
@@ -1013,11 +1022,14 @@ mod tests {
                     }
                     line.clear();
                 }
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-                .unwrap();
+                // Drop the connection without responding to the first two requests.
+                if let Some(status) = status {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
             }
         });
         let client = reqwest::blocking::Client::builder()
