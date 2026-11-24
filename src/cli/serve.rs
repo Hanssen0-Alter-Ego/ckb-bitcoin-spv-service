@@ -3,6 +3,7 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    io,
     net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
@@ -60,11 +61,45 @@ const SPV_RESET_TIP_OFFSET: u32 = 1200;
 const DUPLICATED_TRANSACTION: i64 = -1107;
 const MAX_UNCERTAIN_POLLS: u8 = 3;
 
+fn is_retryable_io(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+    )
+}
+
+fn is_retryable_transport(error: &reqwest::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
+
+    // reqwest's broad request/connect classifications also include TLS and proxy
+    // configuration failures. Retry only concrete transient causes.
+    let mut cause = std::error::Error::source(error);
+    while let Some(inner) = cause {
+        if inner
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+            || inner
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| is_retryable_io(error.kind()))
+        {
+            return true;
+        }
+        cause = inner.source();
+    }
+    false
+}
+
 fn storage_sync_can_proceed(result: Result<bool>, wait: impl FnOnce()) -> Result<bool> {
     match result {
-        Err(Error::BitRpc(BtcRpcError::Http(error)))
-            if error.is_connect() || error.is_timeout() || error.is_request() || error.is_body() =>
-        {
+        Err(Error::BitRpc(BtcRpcError::Http(error))) if is_retryable_transport(&error) => {
             // Do not run any CKB operations until Bitcoin storage is synchronized again.
             log::warn!(
                 "Bitcoin RPC transport error while syncing headers; retrying after the poll interval: {error}"
@@ -951,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_transport_error_waits_then_allows_a_successful_poll() {
+    fn repeated_bitcoin_disconnects_wait_then_allow_a_successful_poll() {
         use std::{
             io::{BufRead, BufReader, Write},
             net::TcpListener,
@@ -961,27 +996,33 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             // Model a peer disconnecting immediately after accepting a connection.
-            drop(listener.accept().unwrap().0);
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(time::Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            loop {
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                line.clear();
+            for _ in 0..2 {
+                drop(listener.accept().unwrap().0);
             }
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            for status in ["200 OK", "401 Unauthorized"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
                 .unwrap();
+            }
         });
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
-            .timeout(time::Duration::from_secs(2))
+            .timeout(time::Duration::from_secs(5))
             .build()
             .unwrap();
 
@@ -995,14 +1036,28 @@ mod tests {
         };
         let mut waits = 0;
         assert!(!storage_sync_can_proceed(poll(), || waits += 1).unwrap());
+        assert!(!storage_sync_can_proceed(poll(), || waits += 1).unwrap());
         assert!(storage_sync_can_proceed(poll(), || waits += 1).unwrap());
-        assert_eq!(waits, 1);
+        assert!(matches!(
+            storage_sync_can_proceed(poll(), || waits += 1),
+            Err(Error::BitRpc(BtcRpcError::Http(error)))
+                if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+        ));
+        assert_eq!(waits, 2);
         server.join().unwrap();
     }
 
     #[test]
     fn permanent_storage_sync_errors_still_propagate() {
         let no_wait = || panic!("non-transport outcomes must not trigger a retry wait");
+        let http = reqwest::blocking::Client::new()
+            .post("invalid URL")
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            storage_sync_can_proceed(Err(BtcRpcError::from(http).into()), no_wait),
+            Err(Error::BitRpc(BtcRpcError::Http(_)))
+        ));
         let rpc = BtcRpcError::from(jsonrpc_core::Error::invalid_params("test"));
         assert!(matches!(
             storage_sync_can_proceed(Err(rpc.into()), no_wait),
@@ -1013,6 +1068,9 @@ mod tests {
             Err(Error::Other(_))
         ));
         assert!(!storage_sync_can_proceed(Ok(false), no_wait).unwrap());
+        assert!(!is_retryable_io(io::ErrorKind::PermissionDenied));
+        assert!(!is_retryable_io(io::ErrorKind::InvalidData));
+        assert!(!is_retryable_io(io::ErrorKind::Other));
     }
 
     #[test]
